@@ -1,0 +1,42 @@
+[package]
+name = "ocshell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "OpenComputers shell over WebSocket (LLM-generated)"
+license = "UNLICENSED"
+authors = ["MagicBOTAlex"]
+readme = "README.md"
+
+[lib]
+name = "ocs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ocs"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+futures-util = "0.3"
+rand = "0.8"
+sha1 = "0.10"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+  "signal",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,38 @@
+name: ocs-test
+
+memory: 512
+
+cpu:
+  tier: 2
+
+gpu:
+  tier: 3
+  screen:
+    width: 80
+    height: 25
+    maxDepth: 8
+
+eeprom:
+  bios: builtin
+  boot: auto
+
+filesystems:
+  - label: openos
+    path: builtin
+    mount: /
+    readonly: false
+
+components:
+  keyboard: true
+  mouse: false
+
+internet:
+  enabled: true
+  timeout: 30
+  tcp: true
+  userAgent: OCShell-test
+
+run:
+  timeout: 0
+  interactive: false
+  terminateDelay: 0

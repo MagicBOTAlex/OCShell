@@ -31,6 +31,13 @@ internet:
   timeout: 30
   tcp: true
   userAgent: OCShell-test
+  # ocplay now implements OpenComputers' address filtering and denies
+  # loopback by default. Local end-to-end tests need an explicit allow rule.
+  filteringRules:
+    - allow ip:127.0.0.1/8
+    - deny private
+    - deny bogon
+    - allow default
 
 run:
   timeout: 0

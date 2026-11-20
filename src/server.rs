@@ -6,7 +6,7 @@
 //!
 //! WARNING: no authentication. See DISCLAIMER.md.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +47,9 @@ const HTTP_AGENT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const AGENT_SOURCE: &str = include_str!("../agent/ocshell.lua");
 
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXEC_ID: AtomicU64 = AtomicU64::new(1);
+
+const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -92,6 +95,7 @@ pub struct RelayState {
     client: Option<PeerHandle>,
     backlog: VecDeque<Message>,
     backlog_bytes: usize,
+    exec_waiters: HashMap<u64, oneshot::Sender<String>>,
     started: Instant,
 }
 
@@ -109,6 +113,7 @@ impl RelayState {
             client: None,
             backlog: VecDeque::new(),
             backlog_bytes: 0,
+            exec_waiters: HashMap::new(),
             started: Instant::now(),
         }
     }
@@ -168,7 +173,26 @@ impl RelayState {
     /// it is dropped rather than growing the server's memory without bound.
     fn relay(&mut self, from: Role, message: Message) {
         match from {
-            Role::Agent => self.deliver_to_client(message),
+            Role::Agent => {
+                // Exec results are routed to their waiting request instead of
+                // the terminal client.
+                if let Message::Text(text) = &message {
+                    if let Some(rest) = text.as_str().strip_prefix("R ") {
+                        if let Some((id, encoded)) = rest.split_once(' ') {
+                            if let (Ok(id), Ok(bytes)) =
+                                (id.parse::<u64>(), hex::decode(encoded.trim()))
+                            {
+                                println!("[ocs] exec {id} result: {} bytes", bytes.len());
+                                self.complete_exec(id, String::from_utf8_lossy(&bytes).to_string());
+                            } else {
+                                println!("[ocs] malformed exec result");
+                            }
+                        }
+                        return;
+                    }
+                }
+                self.deliver_to_client(message)
+            }
             Role::Client => {
                 if let Some(http) = self.http_agent.as_mut() {
                     if http.last_seen.elapsed() <= HTTP_AGENT_TIMEOUT {
@@ -198,6 +222,40 @@ impl RelayState {
                     }
                 }
             }
+        }
+    }
+
+    fn request_exec(&mut self, command: &str) -> Result<(u64, oneshot::Receiver<String>), String> {
+        let id = NEXT_EXEC_ID.fetch_add(1, Ordering::Relaxed);
+        println!("[ocs] exec {id}: {} bytes", command.len());
+        let message = Message::Text(format!("E {id} {}\n", hex::encode(command)).into());
+
+        if let Some(agent) = self.agent.as_ref() {
+            agent
+                .tx
+                .try_send(message)
+                .map_err(|_| "agent is not accepting commands".to_string())?;
+        } else if let Some(http) = self.http_agent.as_mut() {
+            if http.last_seen.elapsed() > HTTP_AGENT_TIMEOUT {
+                self.http_agent = None;
+                return Err("no agent connected".to_string());
+            }
+            if http.queue.len() >= PEER_QUEUE {
+                return Err("agent queue is full".to_string());
+            }
+            http.queue.push_back(message);
+        } else {
+            return Err("no agent connected".to_string());
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        self.exec_waiters.insert(id, sender);
+        Ok((id, receiver))
+    }
+
+    fn complete_exec(&mut self, id: u64, output: String) {
+        if let Some(sender) = self.exec_waiters.remove(&id) {
+            let _ = sender.send(output);
         }
     }
 
@@ -312,6 +370,9 @@ fn router(state: AppState) -> Router {
         .route("/client", get(client_socket))
         .route("/client/", get(client_socket))
         .route("/api/agent/poll", post(agent_poll))
+        .route("/api/agent/result", post(agent_exec_result))
+        .route("/api/exec", post(exec_http))
+        .route("/exec", get(exec_socket))
         .fallback(not_found)
         .with_state(state)
 }
@@ -356,6 +417,8 @@ async fn status_page(State(state): State<AppState>) -> Response {
          <code>ocshell ws://{host}:{port}/agent</code> (direct TCP)<br>\n\
          <code>ocshell https://{host}</code> (HTTPS polling fallback)</p>\n\
          <p>Client: <code>ocs attach ws://{host}:{port}/client</code></p>\n\
+         <p>Exec: <code>ocs exec --url ws://{host}:{port}/exec \"ls\"</code><br>\n\
+         or <code>curl -X POST --data 'ls' http://{host}:{port}/api/exec</code></p>\n\
          </body></html>\n",
         status.backlog_bytes
     );
@@ -375,6 +438,66 @@ async fn status_page(State(state): State<AppState>) -> Response {
 }
 
 async fn health() -> Response {
+    text_response(StatusCode::OK, "ok\n".to_string())
+}
+
+async fn exec_request(state: &AppState, command: String) -> Result<String, String> {
+    let (id, receiver) = { state.relay.lock().await.request_exec(&command)? };
+    match tokio::time::timeout(EXEC_TIMEOUT, receiver).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(_)) => Err("agent disconnected".to_string()),
+        Err(_) => {
+            state.relay.lock().await.exec_waiters.remove(&id);
+            Err("command timed out".to_string())
+        }
+    }
+}
+
+async fn exec_http(State(state): State<AppState>, body: Bytes) -> Response {
+    let command = String::from_utf8_lossy(&body).trim().to_string();
+    if command.is_empty() {
+        return text_response(StatusCode::BAD_REQUEST, "empty command\n".to_string());
+    }
+    match exec_request(&state, command).await {
+        Ok(output) => text_response(StatusCode::OK, output),
+        Err(error) => text_response(StatusCode::SERVICE_UNAVAILABLE, format!("ERROR: {error}\n")),
+    }
+}
+
+async fn exec_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.max_message_size(MAX_PAYLOAD)
+        .on_upgrade(move |socket| handle_exec_socket(socket, state))
+}
+
+async fn handle_exec_socket(mut socket: WebSocket, state: AppState) {
+    let command = match socket.recv().await {
+        Some(Ok(Message::Text(text))) => text.as_str().to_string(),
+        _ => return,
+    };
+    let result = if command.trim().is_empty() {
+        "ERROR: empty command\n".to_string()
+    } else {
+        match exec_request(&state, command).await {
+            Ok(output) => output,
+            Err(error) => format!("ERROR: {error}\n"),
+        }
+    };
+    let _ = socket.send(Message::Text(result.into())).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+#[derive(Deserialize)]
+struct ExecResultQuery {
+    id: u64,
+}
+
+async fn agent_exec_result(
+    State(state): State<AppState>,
+    Query(query): Query<ExecResultQuery>,
+    body: Bytes,
+) -> Response {
+    let output = String::from_utf8_lossy(&body).to_string();
+    state.relay.lock().await.complete_exec(query.id, output);
     text_response(StatusCode::OK, "ok\n".to_string())
 }
 
@@ -756,6 +879,37 @@ mod tests {
         let mut second = server.connect("/client").await;
         agent.send_frame(OP_BINARY, b"for-second").await.unwrap();
         assert_eq!(recv_text(&mut second).await, b"for-second");
+    }
+
+    #[tokio::test]
+    async fn exec_result_is_routed_to_the_request() {
+        let server = TestServer::start().await;
+        let mut agent = server.connect("/agent").await;
+        let mut exec = server.connect("/exec").await;
+
+        exec.send_text("echo hi").await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), agent.recv_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = String::from_utf8(frame.payload).unwrap();
+        let (id, encoded) = request
+            .trim()
+            .strip_prefix("E ")
+            .unwrap()
+            .split_once(' ')
+            .unwrap();
+        assert_eq!(hex::decode(encoded).unwrap(), b"echo hi");
+
+        agent
+            .send_frame(OP_TEXT, format!("R {id} 6869").as_bytes())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), exec.recv_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.payload, b"hi");
     }
 
     #[tokio::test]

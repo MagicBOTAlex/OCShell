@@ -61,6 +61,26 @@ Content-Type: application/octet-stream
 - The same address filtering and `internet.enableHttp` rules apply as for any
   other `internet.request` call.
 
+## One-shot commands
+
+There are two front ends, both backed by the same request/response path:
+
+- `POST /api/exec` — body is the command text; response is the command output.
+- `GET /exec` — WebSocket; send the command as one text frame, receive the
+  output as one text frame, then Close.
+
+The server assigns an id (`E <id> <hex-command>`) and sends it to the connected
+agent over the normal agent transport (WebSocket or `/api/agent/poll`). The
+agent runs the command in a fresh `sh` process with redirect to
+`/home/ocs-exec-<id>.out`, reads the file, removes it, and returns:
+
+- WebSocket agent: a text frame `R <id> <hex-output>`.
+- HTTP agent: `POST /api/agent/result?id=<id>` with the raw output as the body.
+
+The server routes `R` / `/api/agent/result` to the waiting exec caller, not to
+the terminal client. Timeout is 30 seconds; output is capped at 256 KiB. A
+fresh process means `cd` and environment changes do not persist between calls.
+
 ## Handshake
 
 A normal WebSocket upgrade on `/agent` or `/client`:

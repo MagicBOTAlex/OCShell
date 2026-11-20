@@ -21,6 +21,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+async fn http_post(port: u16, path: &str, body: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut data = Vec::new();
+    stream.read_to_end(&mut data).await.unwrap();
+    let text = String::from_utf8_lossy(&data).to_string();
+    let (_, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    body.to_string()
+}
+
 async fn roundtrip(mode: &'static str, agent_url: impl Fn(u16) -> String) {
     let Ok(ocplay) = std::env::var("OCPLAY") else {
         eprintln!("skipping {mode}: OCPLAY is not set");
@@ -119,6 +138,12 @@ async fn roundtrip(mode: &'static str, agent_url: impl Fn(u16) -> String) {
             contains(&output, b"ocplay_autorun"),
             "{mode}: ls output never arrived:\n{}",
             String::from_utf8_lossy(&output)
+        );
+
+        let exec = http_post(port, "/api/exec", b"echo exec-marker").await;
+        assert!(
+            exec.contains("exec-marker"),
+            "{mode}: exec output did not arrive: {exec}"
         );
     });
 

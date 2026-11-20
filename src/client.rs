@@ -541,6 +541,50 @@ async fn writer_task(
     let _ = stop.send(true);
 }
 
+/// Run one command in a fresh in-game shell through the relay.
+pub async fn exec(url: &str, command: &str) -> i32 {
+    let (host, port, mut path) = match parse_ws_url(url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: cannot connect to {url}: {error}");
+            return 1;
+        }
+    };
+    if path == "/" || path.is_empty() {
+        path = "/exec".to_string();
+    }
+
+    let mut stream = match WsStream::connect(&host, port, &path, Duration::from_secs(10)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("error: cannot connect to {url}: {error}");
+            return 1;
+        }
+    };
+
+    if let Err(error) = stream.send_text(command).await {
+        eprintln!("error: cannot send command: {error}");
+        return 1;
+    }
+
+    let mut output = Vec::new();
+    while let Ok(frame) = stream.recv_frame().await {
+        match frame.opcode {
+            OP_TEXT | OP_BINARY => output.extend_from_slice(&frame.payload),
+            OP_CLOSE => break,
+            _ => {}
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    print!("{text}");
+    let _ = io::stdout().flush();
+    if text.starts_with("ERROR:") {
+        return 1;
+    }
+    0
+}
+
 /// Attach the current terminal to an OCShell relay.
 pub async fn attach(url: &str) -> i32 {
     let (host, port, path) = match parse_ws_url(url) {

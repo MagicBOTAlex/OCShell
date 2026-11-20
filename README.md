@@ -152,6 +152,31 @@ If the client attaches after the agent, the server replays the buffered output
 
 ---
 
+## One-shot commands
+
+For automation, skip the terminal and run a command in a fresh in-game shell:
+
+```sh
+./target/release/ocs exec --url ws://oc.deprived.dev:5234/exec "ls /home"
+```
+
+or over plain HTTP:
+
+```sh
+curl -X POST --data 'ls /home' http://oc.deprived.dev:5234/api/exec
+```
+
+- Each call runs in a **new shell process**; `cd`/environment changes do not
+  persist. The working directory starts at `/home` (the agent's cwd).
+- The command’s stdout/stderr are captured to a temporary file, returned as
+  plain text, and the file is removed.
+- Output is capped at 256 KiB; the request times out after 30 seconds.
+- No agent connected returns an error immediately.
+- This executes arbitrary commands and has no authentication, exactly like the
+  terminal.
+
+---
+
 ## How it works
 
 - **Relay:** Tokio + axum. `/agent` and `/client` are WebSocket upgrades; data

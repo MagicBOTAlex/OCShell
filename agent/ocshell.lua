@@ -12,6 +12,7 @@
 
 local component = require("component")
 local computer = require("computer")
+local fs = require("filesystem")
 local shell = require("shell")
 local term = require("term")
 local tty = require("tty")
@@ -34,6 +35,16 @@ end
 local function uptime()
   local ok, value = pcall(computer.uptime)
   return ok and tonumber(value) or 0
+end
+
+local io_open = io.open
+
+local function read_file(path)
+  local handle = io_open(path, "rb")
+  if not handle then return nil end
+  local data = handle:read("*a")
+  handle:close()
+  return data
 end
 
 local function parse_url(url)
@@ -296,6 +307,62 @@ local function resize_screen(cols, rows)
   end
 end
 
+local function from_hex(value)
+  local bytes = {}
+  for pair in value:gmatch("%x%x") do
+    bytes[#bytes + 1] = string.char(tonumber(pair, 16))
+  end
+  return table.concat(bytes)
+end
+
+local function to_hex(value)
+  local bytes = {}
+  for i = 1, #value do
+    bytes[i] = string.format("%02x", string.byte(value, i))
+  end
+  return table.concat(bytes)
+end
+
+local exec_running = false
+local pending_http_results = {}
+
+local function run_exec(id, command)
+  if exec_running then return end
+  exec_running = true
+
+  local path = "/home/ocs-exec-" .. tostring(id) .. ".out"
+  local wrapped = command .. " > " .. path .. " 2>&1"
+  local ok, success, reason = pcall(shell.execute, wrapped)
+  local read_ok, output = pcall(read_file, path)
+  if not read_ok then
+    log("exec output read failed: %s", tostring(output))
+    output = ""
+  end
+  output = output or ""
+  pcall(fs.remove, path)
+
+  if not ok then
+    output = "ERROR: " .. tostring(success) .. "\n" .. output
+  elseif success == false then
+    output = output .. "ERROR: " .. tostring(reason) .. "\n"
+  end
+  if #output > 256 * 1024 then
+    output = output:sub(1, 256 * 1024) .. "\n[truncated]\n"
+  end
+
+  if http_mode then
+    -- Do not open another HTTP request from inside the current poll's
+    -- response processing; queue it and let http_tick send it after the
+    -- current request has fully completed.
+    pending_http_results[#pending_http_results + 1] = { id = id, output = output }
+  else
+    queue_frame(1, "R " .. tostring(id) .. " " .. to_hex(output) .. "\n")
+    flush_out()
+  end
+
+  exec_running = false
+end
+
 local function process_input(text)
   for line in text:gmatch("[^\r\n]+") do
     local command, rest = line:match("^(%S+)%s*(.*)$")
@@ -321,6 +388,11 @@ local function process_input(text)
       local cols, rows = rest:match("^(%d+)%s+(%d+)$")
       if cols then
         resize_screen(tonumber(cols), tonumber(rows))
+      end
+    elseif command == "E" then
+      local id, encoded = rest:match("^(%d+)%s+(%x+)$")
+      if id then
+        run_exec(tonumber(id), from_hex(encoded))
       end
     end
   end
@@ -398,6 +470,19 @@ local function http_tick(state)
   http_errors = 0
   if #response > 0 then
     process_input(response)
+  end
+
+  if #pending_http_results > 0 then
+    local pending = pending_http_results
+    pending_http_results = {}
+    for _, result in ipairs(pending) do
+      local posted, post_err = http_post(
+        http_base .. "/api/agent/result?id=" .. tostring(result.id),
+        result.output)
+      if posted == nil then
+        log("exec result post failed: %s", tostring(post_err))
+      end
+    end
   end
 end
 
@@ -496,6 +581,11 @@ local function check_connection()
 end
 
 local function wrapped_pull(timeout)
+  if exec_running then
+    local result = table.pack(real_pull_signal(timeout or 0))
+    return table.unpack(result, 1, result.n)
+  end
+
   local until_time = timeout and (uptime() + timeout) or nil
   while true do
     check_connection()

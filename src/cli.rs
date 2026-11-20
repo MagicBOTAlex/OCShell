@@ -34,6 +34,13 @@ pub enum Command {
         #[arg(default_value = "ws://127.0.0.1:5235/client")]
         url: String,
     },
+    /// Run one command in a fresh in-game shell and print its output
+    Exec {
+        #[arg(long, default_value = "ws://127.0.0.1:5235/exec")]
+        url: String,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> i32 {
@@ -44,6 +51,7 @@ pub async fn run(cli: Cli) -> i32 {
             public_host,
         } => serve(&host, port, public_host).await,
         Command::Attach { url } => client::attach(&url).await,
+        Command::Exec { url, command } => client::exec(&url, &command.join(" ")).await,
     }
 }
 
@@ -65,6 +73,7 @@ async fn serve(host: &str, port: u16, public_host: Option<String>) -> i32 {
     println!("agent:  ws://{public_host}:{port}/agent");
     println!("agent:  ocshell https://{public_host}   (HTTPS polling fallback)");
     println!("client: ocs attach ws://{public_host}:{port}/client");
+    println!("exec:   ocs exec --url ws://{public_host}:{port}/exec \"ls\"");
     println!("install: wget -f http://{public_host}:{port}/agent.lua /bin/ocshell.lua");
     println!("install: wget -f https://{public_host}/agent.lua /bin/ocshell.lua   (via TLS proxy)");
     println!("listening; Ctrl+C to stop");

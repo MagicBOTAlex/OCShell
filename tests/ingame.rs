@@ -1,7 +1,8 @@
-//! End-to-end test through OS2Playground/ocplay and the real Lua agent.
+//! End-to-end tests through OS2Playground/ocplay and the real Lua agent.
 //!
-//! Skipped unless `OCPLAY` points at an `ocplay` binary (the TCP-enabled
-//! build).
+//! Skipped unless `OCPLAY` points at an `ocplay` binary (the TCP/HTTP-enabled
+//! build). Both the direct WebSocket transport and the HTTPS polling fallback
+//! are exercised.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -20,14 +21,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn shell_roundtrip() {
+async fn roundtrip(mode: &'static str, agent_url: impl Fn(u16) -> String) {
     let Ok(ocplay) = std::env::var("OCPLAY") else {
-        eprintln!("skipping: OCPLAY is not set");
+        eprintln!("skipping {mode}: OCPLAY is not set");
         return;
     };
     if !Path::new(&ocplay).is_file() {
-        eprintln!("skipping: OCPLAY does not point at a file: {ocplay}");
+        eprintln!("skipping {mode}: OCPLAY does not point at a file: {ocplay}");
         return;
     }
 
@@ -46,7 +46,7 @@ async fn shell_roundtrip() {
     let mut process = Command::new(&ocplay)
         .arg(&config)
         .arg(&agent)
-        .arg(format!("ws://127.0.0.1:{port}/agent"))
+        .arg(agent_url(port))
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -84,11 +84,11 @@ async fn shell_roundtrip() {
         let mut client = client.expect("could not attach a client");
 
         let mut output = Vec::new();
-        let prompt_deadline = Instant::now() + Duration::from_secs(20);
+        let prompt_deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < prompt_deadline {
             match tokio::time::timeout(Duration::from_millis(500), client.recv_frame()).await {
                 Ok(Ok(frame)) => output.extend_from_slice(&frame.payload),
-                Ok(Err(error)) => panic!("websocket closed while waiting for prompt: {error}"),
+                Ok(Err(error)) => panic!("{mode}: websocket closed waiting for prompt: {error}"),
                 Err(_) => {}
             }
             if contains(&output, b"/home #") {
@@ -97,18 +97,18 @@ async fn shell_roundtrip() {
         }
         assert!(
             contains(&output, b"/home #"),
-            "never saw the shell prompt:\n{}",
+            "{mode}: never saw the shell prompt:\n{}",
             String::from_utf8_lossy(&output)
         );
 
         client.send_frame(OP_TEXT, b"T 6c73").await.unwrap(); // "ls"
         client.send_frame(OP_TEXT, b"K 28 13 1").await.unwrap(); // Enter
 
-        let listing_deadline = Instant::now() + Duration::from_secs(15);
+        let listing_deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < listing_deadline {
             match tokio::time::timeout(Duration::from_millis(500), client.recv_frame()).await {
                 Ok(Ok(frame)) => output.extend_from_slice(&frame.payload),
-                Ok(Err(error)) => panic!("websocket closed while waiting for ls: {error}"),
+                Ok(Err(error)) => panic!("{mode}: websocket closed waiting for ls: {error}"),
                 Err(_) => {}
             }
             if contains(&output, b"ocplay_autorun") {
@@ -117,7 +117,7 @@ async fn shell_roundtrip() {
         }
         assert!(
             contains(&output, b"ocplay_autorun"),
-            "ls output never arrived:\n{}",
+            "{mode}: ls output never arrived:\n{}",
             String::from_utf8_lossy(&output)
         );
     });
@@ -131,11 +131,21 @@ async fn shell_roundtrip() {
     server_task.abort();
 
     if let Err(error) = result {
-        // Surface the emulator's output when the roundtrip fails.
         eprintln!("--- ocplay stdout ---");
         eprintln!("{}", String::from_utf8_lossy(&stdout));
         eprintln!("--- ocplay stderr ---");
         eprintln!("{}", String::from_utf8_lossy(&stderr));
-        panic!("ingame roundtrip failed: {error}");
+        panic!("{mode} roundtrip failed: {error}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_roundtrip() {
+    roundtrip("websocket", |port| format!("ws://127.0.0.1:{port}/agent")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_polling_roundtrip() {
+    // Plain HTTP in the emulator; the same code path uses HTTPS behind Caddy.
+    roundtrip("https-poll", |port| format!("http://127.0.0.1:{port}")).await;
 }

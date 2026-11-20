@@ -35,6 +35,32 @@ There is exactly one agent slot and one client slot.
 - The server does not originate protocol messages. It only relays frames,
   answers WebSocket control frames, and serves the HTTP endpoints.
 
+## HTTPS polling agent
+
+The agent can replace the `/agent` WebSocket with a single HTTP endpoint:
+
+```http
+POST /api/agent/poll?agent=<id>&state=<state>&version=<version>&uptime=<seconds>
+Content-Type: application/octet-stream
+
+<raw terminal output bytes>
+```
+
+- The request body is the terminal output accumulated since the previous poll.
+  The server forwards it to the client as a binary WebSocket frame (or into the
+  backlog when no client is attached).
+- The response is `text/plain`; each line is a client command exactly as it
+  would have been sent over the WebSocket (`K`, `T`, `X`, `S`).
+- `agent` is `computer.address()`; a new id replaces the previous HTTP agent.
+- There is one agent slot. A WebSocket agent and an HTTP agent replace each
+  other; an HTTP agent is considered disconnected after 20 seconds without a
+  poll.
+- The agent polls at roughly 150 ms while the shell is running. Each request
+  is a complete HTTPS round trip, so latency is higher than the direct
+  WebSocket path.
+- The same address filtering and `internet.enableHttp` rules apply as for any
+  other `internet.request` call.
+
 ## Handshake
 
 A normal WebSocket upgrade on `/agent` or `/client`:
@@ -191,8 +217,10 @@ These are properties of the Lua agent, not of the relay:
 
 - Outgoing buffer capped at 1 MiB. On overflow the agent drops the oldest data
   and logs a warning, rather than freezing the computer.
-- Terminal output is flushed at least every 50 ms while the shell waits on an
-  event; input is polled at the same cadence.
-- If the socket accepts no writes for 10 seconds, the agent disconnects.
+- WebSocket mode flushes and polls at least every 50 ms while the shell waits
+  on an event. HTTPS mode polls at roughly 150 ms and sends the buffered
+  terminal output in the request body.
+- If the WebSocket accepts no writes for 10 seconds, the agent disconnects.
+  In HTTPS mode, 20 consecutive poll failures disconnect the agent.
 - OpenComputers cannot preempt Lua. A program that never yields will not
   stream output and cannot be interrupted.

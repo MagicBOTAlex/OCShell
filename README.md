@@ -30,14 +30,18 @@
 An interactive OpenComputers 1 shell over HTTP/WebSocket.
 
 ```
- in-game OpenOS  ── ws://host:5235/agent ──┐
-                                           │   relay server (no auth)
+ in-game OpenOS  ── ws://host:5235/agent  ──┐
+                └─ https://host/api/agent/poll ─┤   relay server (no auth)
  your terminal  ── ws://host:5235/client ──┘
 ```
 
-- The in-game agent connects **out** to the relay over a raw TCP WebSocket,
-  starts a nested `/bin/sh`, streams the terminal output and injects remote
-  keystrokes.
+- The in-game agent connects **out**, starts a nested `/bin/sh`, streams the
+  terminal output and injects remote keystrokes.
+- Two agent transports:
+  - `ws://host:port/agent` — raw TCP WebSocket (lowest latency, needs
+    `enableTcp` and a plain TCP port).
+  - `https://host` — HTTPS polling fallback using `internet.request`, for
+    deployments where only a TLS reverse proxy is exposed (higher latency).
 - The relay is a single-session bridge: one agent, one client.
 - The CLI is a raw-terminal client: `ocs attach ws://host:5235/client`.
 
@@ -59,18 +63,20 @@ not been run on a real server yet.
 In-game:
 
 - An internet card.
-- `internet.enableTcp = true` (OpenComputers defaults to true, but packs
-  change it).
-- `internet.enableHttp = true` (only to download the agent with `wget`).
+- `internet.enableHttp = true` (required for the agent download and the HTTPS
+  polling fallback).
+- `internet.enableTcp = true` for the raw WebSocket mode (OpenComputers
+  defaults to true, but packs change it). Not needed for HTTPS polling.
 - The host/port must pass OpenComputers' address filtering rules. Private
   addresses are denied by default; use a public host or add an allow rule.
+  For local emulator tests add `allow ip:127.0.0.1/8` before the deny rules.
 - A screen and keyboard attached to the computer (the agent mirrors the real
   terminal).
 
 Host:
 
 - A Rust toolchain (1.75 or newer) and Cargo.
-- The TCP-enabled OS2Playground binary for emulator testing.
+- The TCP/HTTP-enabled OS2Playground binary for emulator testing.
 
 ---
 
@@ -101,21 +107,35 @@ It prints:
 
 ```text
 agent:  ws://<host>:5235/agent
+agent:  ocshell https://<host>   (HTTPS polling fallback)
 client: ocs attach ws://<host>:5235/client
 install: wget -f http://<host>:5235/agent.lua /bin/ocshell.lua
+install: wget -f https://<host>/agent.lua /bin/ocshell.lua   (via TLS proxy)
 ```
 
 ### 2. In-game
 
-At an OpenOS shell:
+At an OpenOS shell, direct TCP mode:
 
 ```sh
 wget -f http://<host>:5235/agent.lua /bin/ocshell.lua
 ocshell ws://<host>:5235/agent
 ```
 
+or, when only the HTTPS reverse proxy is reachable:
+
+```sh
+wget -f https://<host>/agent.lua /bin/ocshell.lua
+ocshell https://<host>
+```
+
 `ocshell` connects, starts a nested shell, and mirrors it. The computer's own
 screen keeps working normally.
+
+The HTTPS mode posts terminal output to `/api/agent/poll` and receives queued
+keystrokes in the response. It does not need a raw TCP port or `enableTcp`,
+but adds one HTTP round trip plus the polling interval (~150 ms in the current
+agent) to every interaction.
 
 ### 3. Attach
 
@@ -139,13 +159,17 @@ If the client attaches after the agent, the server replays the buffered output
   1 MiB of agent output while no client is attached and replays it on attach.
   Replacing a peer closes the old connection; a failed write drops the frame
   and removes only that peer.
-- **Agent transport:** `component.internet.connect(host, port)` + a hand
-  written RFC 6455 client. The OC handle is used with **dot calls**
+- **Agent transport (direct):** `component.internet.connect(host, port)` + a
+  hand written RFC 6455 client. The OC handle is used with **dot calls**
   (`sock.read`, `sock.write`, `sock.finishConnect`, `sock.close`), matching
   real OpenComputers; colon calls are an emulator-only extension.
+- **Agent transport (HTTPS):** `internet.request` POSTs to
+  `/api/agent/poll?agent=...` with accumulated terminal output as the body;
+  the response is the queued client commands. The server treats this as a
+  virtual agent and bridges it to the WebSocket client, including backlog.
 - **Terminal capture:** the agent wraps `tty.stream.write`, which is the sink
   behind `io.write`, `term.write`, prompts and command output. It sends that
-  byte stream as WebSocket binary frames.
+  byte stream as WebSocket binary frames (or the HTTP POST body).
 - **Colour/clear/cursor:** `term.clear` and `term.setCursor` are wrapped to
   emit ANSI sequences, because they draw directly to the GPU.
 - **Input:** client text becomes `computer.pushSignal("key_down", keyboard,
@@ -162,16 +186,19 @@ If the client attaches after the agent, the server replays the buffered output
 - **Raw terminal stream, not a GPU mirror.** Programs that draw directly with
   `gpu.set` instead of using `term`/`tty` will not render through OCShell.
   Normal shell commands, `lua`, and most `term`-based programs work.
-- **No TLS.** `ws://` only. The internet card has no TLS stack here.
+- **No TLS on the raw WebSocket path.** `ws://` only; the OC TCP socket has no
+  TLS stack. Use the HTTPS polling mode behind a TLS proxy if you need
+  encrypted transport.
 - **No auth.** Single agent, single client, anyone can attach.
 - **Single session.** A new agent/client replaces the old one.
 - **ASCII/UTF-8:** printable ASCII is batched; non-ASCII is sent one codepoint
   at a time. Wide characters are not fully modelled.
 - **10-second output stall guard:** if the socket stops accepting writes for
   10 seconds, the agent disconnects rather than hanging the computer.
-- **Emulator gaps:** OS2Playground's TCP support is not 1:1 with the mod yet.
-  See its README and the parity audit. Most importantly, the emulator has no
-  address filtering and no `internet_ready` signal; OCShell polls instead.
+- **HTTPS polling latency:** output and input wait for the poll interval and
+  one HTTPS round trip. Fine for a shell, unpleasant for interactive games.
+- **Emulator:** OS2Playground now implements TCP, `internet_ready`, connection
+  limits and OC-style filtering. Remaining gaps are tracked in that repo.
 
 ---
 
@@ -181,10 +208,10 @@ If the client attaches after the agent, the server replays the buffered output
 cargo test
 ```
 
-This runs the WebSocket framing/handshake, relay, backlog, HTTP and key-mapping
-tests. The end-to-end test boots OpenOS, runs the agent over TCP, attaches a
-client, types `ls`, and asserts the listing. It is skipped unless `OCPLAY`
-points at the TCP-enabled `ocplay` binary:
+This runs the WebSocket framing/handshake, relay, backlog, HTTP polling and
+key-mapping tests. Two end-to-end tests boot OpenOS, run the agent over both
+transports, attach a client, type `ls`, and assert the listing. They are
+skipped unless `OCPLAY` points at the TCP/HTTP-enabled `ocplay` binary:
 
 ```sh
 OCPLAY=/path/to/OS2Playground/target/release/ocplay \
@@ -196,7 +223,7 @@ OCPLAY=/path/to/OS2Playground/target/release/ocplay \
 ## Layout
 
 ```text
-agent/ocshell.lua       in-game WebSocket agent + nested shell wrapper
+agent/ocshell.lua       in-game WebSocket/HTTPS agent + nested shell wrapper
 Cargo.toml              single crate, binary `ocs`
 src/main.rs             entry point
 src/cli.rs              ocs serve / attach

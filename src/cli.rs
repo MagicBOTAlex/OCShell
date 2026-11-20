@@ -63,8 +63,10 @@ async fn serve(host: &str, port: u16, public_host: Option<String>) -> i32 {
 
     println!("OCShell is LLM-generated, unauthenticated software. See DISCLAIMER.md.");
     println!("agent:  ws://{public_host}:{port}/agent");
+    println!("agent:  ocshell https://{public_host}   (HTTPS polling fallback)");
     println!("client: ocs attach ws://{public_host}:{port}/client");
     println!("install: wget -f http://{public_host}:{port}/agent.lua /bin/ocshell.lua");
+    println!("install: wget -f https://{public_host}/agent.lua /bin/ocshell.lua   (via TLS proxy)");
     println!("listening; Ctrl+C to stop");
 
     if let Err(error) = server.run().await {

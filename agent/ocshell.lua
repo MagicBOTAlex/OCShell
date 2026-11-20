@@ -3,11 +3,12 @@
 -- WARNING: LLM-generated. See DISCLAIMER.md.
 --
 -- Usage:
---   ocshell ws://host:port/agent
+--   ocshell ws://host:port/agent          (raw TCP WebSocket)
+--   ocshell https://host[/agent]          (HTTPS polling fallback)
 --
--- Connects to the OCShell relay over a raw TCP WebSocket, starts a nested
--- OpenOS shell, streams the terminal output to the relay and injects remote
--- keystrokes into the machine. Requires an internet card with TCP enabled.
+-- Starts a nested OpenOS shell, streams the terminal output to the relay and
+-- injects remote keystrokes into the machine. The ws:// mode needs an internet
+-- card with TCP enabled; the https:// mode needs HTTP(S) only.
 
 local component = require("component")
 local computer = require("computer")
@@ -50,15 +51,15 @@ end
 local raw_args = table.pack(...)
 local url = raw_args[1]
 if type(url) ~= "string" then
-  io.write("usage: ocshell ws://host:port/agent\n")
+  io.write("usage: ocshell ws://host:port/agent | https://host[/agent]\n")
   return 1
 end
 
-local host, port, path = parse_url(url)
-if not host then
-  log("%s", tostring(port))
-  return 1
-end
+local http_mode = url:match("^https?://") ~= nil
+local http_base
+local host, port, path
+local sock
+local inbuf = ""
 
 local inet = component.internet
 if not inet then
@@ -66,103 +67,119 @@ if not inet then
   return 1
 end
 
-local connect_ok, sock, connect_err = pcall(inet.connect, host, port)
-if not connect_ok then
-  log("connect failed: %s", tostring(sock))
-  return 1
-end
-if not sock then
-  log("connect failed: %s", tostring(connect_err))
-  return 1
-end
+if http_mode then
+  http_base = url:gsub("/+$", ""):gsub("/agent$", "")
+  if not http_base:match("^https?://[^/]+") then
+    log("invalid HTTPS base URL: %s", url)
+    return 1
+  end
+else
+  host, port, path = parse_url(url)
+  if not host then
+    log("%s", tostring(port))
+    return 1
+  end
 
-local deadline = uptime() + CONNECT_TIMEOUT
-while true do
-  local ok, connected, reason = pcall(sock.finishConnect)
+  local connect_ok, connect_err
+  connect_ok, sock, connect_err = pcall(inet.connect, host, port)
+  if not connect_ok then
+    log("connect failed: %s", tostring(sock))
+    return 1
+  end
+  if not sock then
+    log("connect failed: %s", tostring(connect_err))
+    return 1
+  end
+
+  local deadline = uptime() + CONNECT_TIMEOUT
+  while true do
+    local ok, connected, reason = pcall(sock.finishConnect)
+    if not ok then
+      log("connect failed: %s", tostring(connected))
+      pcall(sock.close)
+      return 1
+    end
+    if connected then break end
+    if connected == nil and reason then
+      log("connect failed: %s", tostring(reason))
+      pcall(sock.close)
+      return 1
+    end
+    if uptime() > deadline then
+      log("connect timed out")
+      pcall(sock.close)
+      return 1
+    end
+    os.sleep(0.05)
+  end
+
+  local function write_all(data, timeout)
+    local until_time = uptime() + (timeout or 5)
+    while #data > 0 do
+      local written, reason = sock.write(data)
+      if type(written) ~= "number" then
+        return nil, reason or "write failed"
+      end
+      if written > 0 then
+        data = data:sub(written + 1)
+      elseif uptime() > until_time then
+        return nil, "write timed out"
+      else
+        os.sleep(0.01)
+      end
+    end
+    return true
+  end
+
+  local key = "dGhlIHNhbXBsZSBub25jZQ=="
+  local request = table.concat({
+    "GET " .. path .. " HTTP/1.1",
+    "Host: " .. host .. ":" .. tostring(port),
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    "Sec-WebSocket-Key: " .. key,
+    "Sec-WebSocket-Version: 13",
+    "", "",
+  }, "\r\n")
+
+  local ok, err = write_all(request, 5)
   if not ok then
-    log("connect failed: %s", tostring(connected))
+    log("handshake write failed: %s", tostring(err))
     pcall(sock.close)
     return 1
   end
-  if connected then break end
-  if connected == nil and reason then
-    log("connect failed: %s", tostring(reason))
-    pcall(sock.close)
-    return 1
-  end
-  if uptime() > deadline then
-    log("connect timed out")
-    pcall(sock.close)
-    return 1
-  end
-  os.sleep(0.05)
-end
 
-local function write_all(data, timeout)
-  local until_time = uptime() + (timeout or 5)
-  while #data > 0 do
-    local written, reason = sock.write(data)
-    if type(written) ~= "number" then
-      return nil, reason or "write failed"
+  local header_deadline = uptime() + 5
+  while not inbuf:find("\r\n\r\n", 1, true) do
+    local data = sock.read(1024)
+    if data == nil then
+      log("connection closed during handshake")
+      pcall(sock.close)
+      return 1
     end
-    if written > 0 then
-      data = data:sub(written + 1)
-    elseif uptime() > until_time then
-      return nil, "write timed out"
-    else
-      os.sleep(0.01)
+    if #data > 0 then inbuf = inbuf .. data end
+    if uptime() > header_deadline then
+      log("handshake timed out")
+      pcall(sock.close)
+      return 1
     end
+    os.sleep(0.02)
   end
-  return true
-end
 
-local key = "dGhlIHNhbXBsZSBub25jZQ=="
-local request = table.concat({
-  "GET " .. path .. " HTTP/1.1",
-  "Host: " .. host .. ":" .. tostring(port),
-  "Upgrade: websocket",
-  "Connection: Upgrade",
-  "Sec-WebSocket-Key: " .. key,
-  "Sec-WebSocket-Version: 13",
-  "", "",
-}, "\r\n")
-
-local ok, err = write_all(request, 5)
-if not ok then
-  log("handshake write failed: %s", tostring(err))
-  pcall(sock.close)
-  return 1
-end
-
-local inbuf = ""
-local header_deadline = uptime() + 5
-while not inbuf:find("\r\n\r\n", 1, true) do
-  local data = sock.read(1024)
-  if data == nil then
-    log("connection closed during handshake")
+  local head_end = inbuf:find("\r\n\r\n", 1, true)
+  local head = inbuf:sub(1, head_end - 1)
+  inbuf = inbuf:sub(head_end + 4)
+  if not head:match("^HTTP/%d+%.%d+ 101") then
+    log("handshake rejected: %s", head:match("^[^\r\n]*") or "?")
     pcall(sock.close)
     return 1
   end
-  if #data > 0 then inbuf = inbuf .. data end
-  if uptime() > header_deadline then
-    log("handshake timed out")
-    pcall(sock.close)
-    return 1
-  end
-  os.sleep(0.02)
-end
-
-local head_end = inbuf:find("\r\n\r\n", 1, true)
-local head = inbuf:sub(1, head_end - 1)
-inbuf = inbuf:sub(head_end + 4)
-if not head:match("^HTTP/%d+%.%d+ 101") then
-  log("handshake rejected: %s", head:match("^[^\r\n]*") or "?")
-  pcall(sock.close)
-  return 1
 end
 
 math.randomseed(os.time() + math.floor(uptime() * 1000))
-assert(bit, "no bit32 implementation available")
+if not http_mode then
+  assert(bit, "no bit32 implementation available")
+end
 
 local outbuf = ""
 local termbuf = ""
@@ -253,7 +270,11 @@ end
 
 local function queue_term(value)
   termbuf = termbuf .. tostring(value or "")
-  if #termbuf >= TERM_CHUNK then
+  if http_mode then
+    if #termbuf > 1024 * 1024 then
+      termbuf = termbuf:sub(-512 * 1024)
+    end
+  elseif #termbuf >= TERM_CHUNK then
     flush_term()
   end
 end
@@ -282,6 +303,81 @@ local function process_input(text)
     elseif command == "S" then
       -- Client-side terminal size; the OC screen is fixed by the GPU.
     end
+  end
+end
+
+local http_last = 0
+local http_errors = 0
+local http_inflight = false
+
+local function http_agent_id()
+  local ok, value = pcall(computer.address)
+  if ok and type(value) == "string" and #value > 0 then
+    return value
+  end
+  return "http-agent"
+end
+
+local function urlencode(value)
+  return (tostring(value or ""):gsub("[^%w%-%._~]", function(character)
+    return string.format("%%%02X", string.byte(character))
+  end))
+end
+
+local function http_post(target, body)
+  local internet = require("internet")
+  local ok, handle, reason = pcall(internet.request, target, body, {
+    ["content-type"] = "application/octet-stream",
+    ["user-agent"] = AGENT,
+  }, "POST")
+  if not ok then return nil, tostring(handle) end
+  if not handle then return nil, tostring(reason) end
+
+  local chunks = {}
+  local read_ok, err = pcall(function()
+    for chunk in handle do
+      chunks[#chunks + 1] = chunk
+    end
+  end)
+  if not read_ok then return nil, tostring(err) end
+  return table.concat(chunks)
+end
+
+local function http_tick(state)
+  if http_inflight then return end
+  local now = uptime()
+  if state == "running" and now - http_last < 0.15 then return end
+  http_last = now
+
+  local body = termbuf
+  termbuf = ""
+  local query = table.concat({
+    "agent=" .. urlencode(http_agent_id()),
+    "state=" .. urlencode(state or ""),
+    "version=" .. urlencode(AGENT),
+    "uptime=" .. tostring(math.floor(now)),
+  }, "&")
+
+  http_inflight = true
+  local response, err = http_post(http_base .. "/api/agent/poll?" .. query, body)
+  http_inflight = false
+
+  if response == nil then
+    termbuf = body .. termbuf
+    http_errors = http_errors + 1
+    if http_errors == 1 or http_errors % 10 == 0 then
+      log("HTTP poll failed (%d): %s", http_errors, tostring(err))
+    end
+    if http_errors >= 20 then
+      log("too many HTTP failures; disconnecting")
+      disconnected = true
+    end
+    return
+  end
+
+  http_errors = 0
+  if #response > 0 then
+    process_input(response)
   end
 end
 
@@ -383,8 +479,12 @@ local function wrapped_pull(timeout)
   local until_time = timeout and (uptime() + timeout) or nil
   while true do
     check_connection()
-    flush_term()
-    poll_input()
+    if http_mode then
+      http_tick("running")
+    else
+      flush_term()
+      poll_input()
+    end
     check_connection()
 
     local wait = FRAME_INTERVAL
@@ -398,11 +498,11 @@ local function wrapped_pull(timeout)
 
     local result = table.pack(real_pull_signal(wait))
     if result.n > 0 then
-      flush_term()
+      if http_mode then http_tick("running") else flush_term() end
       return table.unpack(result, 1, result.n)
     end
     if until_time and uptime() >= until_time then
-      flush_term()
+      if http_mode then http_tick("running") else flush_term() end
       return
     end
   end
@@ -410,17 +510,21 @@ end
 
 computer.pullSignal = wrapped_pull
 queue_term("\27[2J\27[H")
-flush_term()
+if http_mode then
+  http_tick("starting")
+else
+  flush_term()
 
-local width, height = 80, 25
-if component.isAvailable and component.isAvailable("gpu") then
-  local w, h = component.gpu.getResolution()
-  if type(w) == "number" and type(h) == "number" then
-    width, height = w, h
+  local width, height = 80, 25
+  if component.isAvailable and component.isAvailable("gpu") then
+    local w, h = component.gpu.getResolution()
+    if type(w) == "number" and type(h) == "number" then
+      width, height = w, h
+    end
   end
+  queue_frame(1, "SIZE " .. width .. " " .. height .. "\n")
+  flush_out()
 end
-queue_frame(1, "SIZE " .. width .. " " .. height .. "\n")
-flush_out()
 
 local ok_shell, shell_err = pcall(function()
   local sh_file = shell.resolve("/bin/sh.lua")
@@ -429,8 +533,12 @@ local ok_shell, shell_err = pcall(function()
 end)
 
 computer.pullSignal = real_pull_signal
-flush_term()
-pcall(sock.close)
+if http_mode then
+  http_tick("stopped")
+else
+  flush_term()
+  pcall(sock.close)
+end
 
 if not ok_shell and not tostring(shell_err):find("ocs:disconnect", 1, true) then
   log("shell ended with error: %s", tostring(shell_err))

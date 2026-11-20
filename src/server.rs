@@ -11,15 +11,17 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -31,6 +33,15 @@ pub const BACKLOG_LIMIT: usize = 1024 * 1024;
 /// Outbound messages queued for one attached peer. Agent output arrives in
 /// 4 KiB chunks, so this is roughly 4 MiB before a stalled peer is dropped.
 const PEER_QUEUE: usize = 1024;
+
+/// An agent using the HTTP(S) polling fallback instead of a WebSocket.
+struct HttpAgent {
+    id: String,
+    queue: VecDeque<Message>,
+    last_seen: Instant,
+}
+
+const HTTP_AGENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The in-game agent, embedded so the binary is self-contained.
 pub const AGENT_SOURCE: &str = include_str!("../agent/ocshell.lua");
@@ -77,6 +88,7 @@ pub struct Status {
 
 pub struct RelayState {
     agent: Option<PeerHandle>,
+    http_agent: Option<HttpAgent>,
     client: Option<PeerHandle>,
     backlog: VecDeque<Message>,
     backlog_bytes: usize,
@@ -93,6 +105,7 @@ impl RelayState {
     pub fn new() -> Self {
         Self {
             agent: None,
+            http_agent: None,
             client: None,
             backlog: VecDeque::new(),
             backlog_bytes: 0,
@@ -103,7 +116,10 @@ impl RelayState {
     fn attach(&mut self, peer: PeerHandle, ip: IpAddr) -> Vec<Message> {
         let role = peer.role;
         let old = match role {
-            Role::Agent => self.agent.replace(peer),
+            Role::Agent => {
+                self.http_agent = None;
+                self.agent.replace(peer)
+            }
             Role::Client => self.client.replace(peer),
         };
         // Dropping the old handle closes its cancel channel; its task exits.
@@ -152,24 +168,22 @@ impl RelayState {
     /// it is dropped rather than growing the server's memory without bound.
     fn relay(&mut self, from: Role, message: Message) {
         match from {
-            Role::Agent => {
-                let target = self.client.as_ref().map(|peer| Delivery {
-                    role: Role::Client,
-                    id: peer.id,
-                    tx: peer.tx.clone(),
-                });
-                if let Some(target) = target {
-                    match target.tx.try_send(message) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                            self.detach(target.role, target.id);
-                        }
-                    }
-                    return;
-                }
-                self.push_backlog(message);
-            }
+            Role::Agent => self.deliver_to_client(message),
             Role::Client => {
+                if let Some(http) = self.http_agent.as_mut() {
+                    if http.last_seen.elapsed() <= HTTP_AGENT_TIMEOUT {
+                        if let Message::Text(text) = message {
+                            if http.queue.len() >= PEER_QUEUE {
+                                http.queue.pop_front();
+                            }
+                            http.queue.push_back(Message::Text(text));
+                        }
+                        return;
+                    }
+                    self.http_agent = None;
+                    println!("[ocs] http agent timed out");
+                }
+
                 let target = self.agent.as_ref().map(|peer| Delivery {
                     role: Role::Agent,
                     id: peer.id,
@@ -187,6 +201,64 @@ impl RelayState {
         }
     }
 
+    fn deliver_to_client(&mut self, message: Message) {
+        let target = self.client.as_ref().map(|peer| Delivery {
+            role: Role::Client,
+            id: peer.id,
+            tx: peer.tx.clone(),
+        });
+        if let Some(target) = target {
+            match target.tx.try_send(message) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    self.detach(target.role, target.id);
+                }
+            }
+            return;
+        }
+        self.push_backlog(message);
+    }
+
+    /// Handle one HTTP polling request from the agent. The body is terminal
+    /// output; the response is the concatenated client command lines.
+    fn http_poll(&mut self, id: String, body: Vec<u8>) -> String {
+        if self.agent.take().is_some() {
+            println!("[ocs] websocket agent replaced by http agent");
+        }
+
+        let replace = self
+            .http_agent
+            .as_ref()
+            .map_or(true, |agent| agent.id != id);
+        if replace {
+            self.http_agent = Some(HttpAgent {
+                id: id.clone(),
+                queue: VecDeque::new(),
+                last_seen: Instant::now(),
+            });
+            println!("[ocs] http agent connected ({id})");
+        } else if let Some(agent) = self.http_agent.as_mut() {
+            agent.last_seen = Instant::now();
+        }
+
+        if !body.is_empty() {
+            self.deliver_to_client(Message::Binary(body.into()));
+        }
+
+        let mut commands = String::new();
+        if let Some(agent) = self.http_agent.as_mut() {
+            while let Some(message) = agent.queue.pop_front() {
+                if let Message::Text(text) = message {
+                    commands.push_str(text.as_str());
+                    if !commands.ends_with('\n') {
+                        commands.push('\n');
+                    }
+                }
+            }
+        }
+        commands
+    }
+
     fn push_backlog(&mut self, message: Message) {
         let length = payload_len(&message);
         self.backlog.push_back(message);
@@ -200,8 +272,12 @@ impl RelayState {
     }
 
     pub fn status(&self) -> Status {
+        let http_agent = self
+            .http_agent
+            .as_ref()
+            .is_some_and(|agent| agent.last_seen.elapsed() <= HTTP_AGENT_TIMEOUT);
         Status {
-            agent: self.agent.is_some(),
+            agent: self.agent.is_some() || http_agent,
             client: self.client.is_some(),
             backlog_bytes: self.backlog_bytes,
             uptime_secs: self.started.elapsed().as_secs_f64(),
@@ -235,6 +311,7 @@ fn router(state: AppState) -> Router {
         .route("/agent/", get(agent_socket))
         .route("/client", get(client_socket))
         .route("/client/", get(client_socket))
+        .route("/api/agent/poll", post(agent_poll))
         .fallback(not_found)
         .with_state(state)
 }
@@ -276,7 +353,8 @@ async fn status_page(State(state): State<AppState>) -> Response {
          </table>\n\
          <p>Install in-game:<br>\n\
          <code>wget -f http://{host}:{port}/agent.lua /bin/ocshell.lua</code><br>\n\
-         <code>ocshell ws://{host}:{port}/agent</code></p>\n\
+         <code>ocshell ws://{host}:{port}/agent</code> (direct TCP)<br>\n\
+         <code>ocshell https://{host}</code> (HTTPS polling fallback)</p>\n\
          <p>Client: <code>ocs attach ws://{host}:{port}/client</code></p>\n\
          </body></html>\n",
         status.backlog_bytes
@@ -298,6 +376,21 @@ async fn status_page(State(state): State<AppState>) -> Response {
 
 async fn health() -> Response {
     text_response(StatusCode::OK, "ok\n".to_string())
+}
+
+#[derive(Deserialize)]
+struct AgentPollQuery {
+    agent: Option<String>,
+}
+
+async fn agent_poll(
+    State(state): State<AppState>,
+    Query(query): Query<AgentPollQuery>,
+    body: Bytes,
+) -> Response {
+    let id = query.agent.unwrap_or_else(|| "http-agent".to_string());
+    let commands = state.relay.lock().await.http_poll(id, body.to_vec());
+    text_response(StatusCode::OK, commands)
 }
 
 async fn agent_lua() -> Response {
@@ -562,6 +655,22 @@ mod tests {
         (status, head.to_string(), body.to_string())
     }
 
+    async fn http_post(port: u16, path: &str, body: &[u8]) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+             Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).await.unwrap();
+        let text = String::from_utf8_lossy(&data).to_string();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        body.to_string()
+    }
+
     async fn recv_text(stream: &mut WsStream<TcpStream>) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(2), stream.recv_frame())
             .await
@@ -647,6 +756,42 @@ mod tests {
         let mut second = server.connect("/client").await;
         agent.send_frame(OP_BINARY, b"for-second").await.unwrap();
         assert_eq!(recv_text(&mut second).await, b"for-second");
+    }
+
+    #[tokio::test]
+    async fn http_agent_relays_both_directions() {
+        let server = TestServer::start().await;
+        let mut client = server.connect("/client").await;
+
+        // Agent output arrives in the POST body.
+        http_post(server.port, "/api/agent/poll?agent=test", b"http-output").await;
+        let frame = tokio::time::timeout(Duration::from_secs(2), client.recv_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.opcode, OP_BINARY);
+        assert_eq!(frame.payload, b"http-output");
+
+        // Client input is returned in the next poll response.
+        client.send_text("K 28 13 1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let commands = http_post(server.port, "/api/agent/poll?agent=test", b"").await;
+        assert!(commands.contains("K 28 13 1"), "{commands}");
+
+        let (_, _, body) = http_get(server.port, "/").await;
+        assert!(body.contains("<td>agent</td><td><code>connected</code>"));
+    }
+
+    #[tokio::test]
+    async fn http_agent_output_is_backlogged_before_client_attach() {
+        let server = TestServer::start().await;
+        http_post(server.port, "/api/agent/poll?agent=test", b"early-output").await;
+        let mut client = server.connect("/client").await;
+        let frame = tokio::time::timeout(Duration::from_secs(2), client.recv_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.payload, b"early-output");
     }
 
     #[tokio::test]

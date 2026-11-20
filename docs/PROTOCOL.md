@@ -98,9 +98,10 @@ line. Lines are `<command> <arguments>`.
 
 ### `S <cols> <rows>`
 
-Terminal size, sent once immediately after connecting. The agent ignores it
-(the OpenComputers screen resolution is fixed by the GPU). Included for future
-use.
+Terminal size, sent once immediately after connecting (currently `S 80 25`).
+The agent resizes the GPU/tty to that size, clamped to `gpu.maxResolution()`,
+and clears the screen. The client renders a local 80x25 VT100 screen, so a
+wider local terminal cannot change line wrapping.
 
 ### `T <hex>`
 

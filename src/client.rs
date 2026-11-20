@@ -1,11 +1,15 @@
 //! Interactive raw-terminal client for OCShell.
 
 use std::io::{self, IsTerminal, Read, Write};
+use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::terminal;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use vt100::Parser;
 
 use crate::ws::{
     parse_ws_url, WsReader, WsStream, WsWriter, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT,
@@ -329,34 +333,179 @@ fn is_status_text(payload: &[u8]) -> bool {
         || payload.starts_with(b"SIZE ")
 }
 
+struct ScreenState {
+    parser: Parser,
+    dirty: bool,
+}
+
+impl ScreenState {
+    fn new() -> Self {
+        Self {
+            parser: Parser::new(
+                NonZeroU16::new(25).unwrap(),
+                NonZeroU16::new(80).unwrap(),
+                0,
+            ),
+            dirty: true,
+        }
+    }
+
+    fn feed(&mut self, payload: &[u8]) {
+        self.parser.process(payload);
+        self.dirty = true;
+    }
+
+    fn render(&mut self) -> Option<String> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+        Some(render_screen(self.parser.screen()))
+    }
+}
+
+fn ansi_color(color: vt100::Color, foreground: bool) -> String {
+    let layer = if foreground { 38 } else { 48 };
+    match color {
+        vt100::Color::Default => {
+            if foreground {
+                "\x1b[39m".to_string()
+            } else {
+                "\x1b[49m".to_string()
+            }
+        }
+        vt100::Color::Idx(index) => format!("\x1b[{layer};5;{index}m"),
+        vt100::Color::Rgb(red, green, blue) => {
+            format!("\x1b[{layer};2;{red};{green};{blue}m")
+        }
+    }
+}
+
+/// Render an 80x25 virtual screen into a possibly wider real terminal.
+///
+/// Every row is positioned explicitly and contains exactly the screen width in
+/// cells, so the local terminal's own wrapping never changes line breaks.
+/// `contents_formatted()` cannot be used here: it relies on the target
+/// terminal having the same width for wrapped rows.
+fn render_screen(screen: &vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let rows = rows.get();
+    let cols = cols.get();
+    let mut out = String::with_capacity((cols as usize + 16) * rows as usize);
+    let mut last_fg = None;
+    let mut last_bg = None;
+    let mut last_bold = false;
+    let mut last_underline = false;
+    let mut last_inverse = false;
+
+    out.push_str("\x1b[0m");
+    for row in 0..rows {
+        out.push_str(&format!("\x1b[{};1H", row + 1));
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                out.push(' ');
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+
+            let fg = cell.fgcolor();
+            if last_fg != Some(fg) {
+                out.push_str(&ansi_color(fg, true));
+                last_fg = Some(fg);
+            }
+            let bg = cell.bgcolor();
+            if last_bg != Some(bg) {
+                out.push_str(&ansi_color(bg, false));
+                last_bg = Some(bg);
+            }
+            if cell.bold() != last_bold {
+                out.push_str(if cell.bold() { "\x1b[1m" } else { "\x1b[22m" });
+                last_bold = cell.bold();
+            }
+            if cell.underline() != last_underline {
+                out.push_str(if cell.underline() {
+                    "\x1b[4m"
+                } else {
+                    "\x1b[24m"
+                });
+                last_underline = cell.underline();
+            }
+            if cell.inverse() != last_inverse {
+                out.push_str(if cell.inverse() {
+                    "\x1b[7m"
+                } else {
+                    "\x1b[27m"
+                });
+                last_inverse = cell.inverse();
+            }
+
+            if cell.has_contents() {
+                out.push_str(cell.contents());
+            } else {
+                out.push(' ');
+            }
+        }
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    if screen.hide_cursor() {
+        out.push_str("\x1b[?25l");
+    } else {
+        out.push_str(&format!(
+            "\x1b[{};{}H\x1b[?25h",
+            cursor_row + 1,
+            cursor_col + 1
+        ));
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
+fn render_loop(screen: Arc<Mutex<ScreenState>>, stop: Arc<AtomicBool>) {
+    let mut stdout = io::stdout();
+    let mut last = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        let frame = {
+            let mut state = screen.lock().unwrap_or_else(|e| e.into_inner());
+            state.render()
+        };
+        if let Some(frame) = frame {
+            if frame != last {
+                let _ = stdout.write_all(frame.as_bytes());
+                let _ = stdout.flush();
+                last = frame;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
 async fn reader_task(
     mut reader: WsReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     stop: watch::Sender<bool>,
+    screen: Arc<Mutex<ScreenState>>,
 ) {
-    let mut saw_output = false;
-    let mut stdout = io::stdout();
-
     while let Ok(frame) = reader.recv_frame().await {
         match frame.opcode {
             OP_TEXT | OP_BINARY => {
                 if frame.opcode == OP_TEXT && is_status_text(&frame.payload) {
-                    if !saw_output && !frame.payload.starts_with(b"SIZE ") {
-                        let text = std::str::from_utf8(&frame.payload)
-                            .unwrap_or_default()
-                            .trim();
-                        let _ = stdout.write_all(format!("\r\n[ocs] {text}\r\n").as_bytes());
-                        let _ = stdout.flush();
+                    // SIZE is handled by ScreenState; other status lines are
+                    // intentionally hidden so they cannot corrupt the screen.
+                    if frame.payload.starts_with(b"SIZE ") {
+                        screen
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .feed(&frame.payload);
                     }
                     continue;
                 }
-                saw_output = true;
-                if stdout.write_all(&frame.payload).is_err() {
-                    break;
-                }
-                if stdout.flush().is_err() {
-                    break;
-                }
+                screen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .feed(&frame.payload);
             }
             OP_PING => {
                 if outgoing.send(Outgoing::Pong(frame.payload)).is_err() {
@@ -415,11 +564,21 @@ pub async fn attach(url: &str) -> i32 {
         return 1;
     }
 
+    let (cols, rows) = terminal::size().unwrap_or((80, 25));
+    if cols < 80 || rows < 25 {
+        eprintln!(
+            "error: terminal is {cols}x{rows}; OCShell needs at least 80x25 \
+             because the OpenComputers screen is 80x25"
+        );
+        return 1;
+    }
+
     eprintln!("OCShell attached to {url} (Ctrl+] detaches)");
 
-    let (cols, rows) = terminal::size().unwrap_or((80, 25));
     let mut stream = stream;
-    if let Err(error) = stream.send_text(&format!("S {cols} {rows}")).await {
+    // The client keeps a local 80x25 VT screen and renders it into the real
+    // terminal, so a wider/narrower local terminal cannot change line breaks.
+    if let Err(error) = stream.send_text("S 80 25").await {
         eprintln!("error: cannot talk to {url}: {error}");
         return 1;
     }
@@ -436,7 +595,20 @@ pub async fn attach(url: &str) -> i32 {
     let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
     let (stop, mut stopped) = watch::channel(false);
 
-    let reader_handle = tokio::spawn(reader_task(reader, outgoing.clone(), stop.clone()));
+    let screen = Arc::new(Mutex::new(ScreenState::new()));
+    let render_stop = Arc::new(AtomicBool::new(false));
+    let renderer = {
+        let screen = screen.clone();
+        let render_stop = render_stop.clone();
+        std::thread::spawn(move || render_loop(screen, render_stop))
+    };
+
+    let reader_handle = tokio::spawn(reader_task(
+        reader,
+        outgoing.clone(),
+        stop.clone(),
+        screen.clone(),
+    ));
     let mut writer_handle = tokio::spawn(writer_task(writer, outgoing_rx, stop.clone()));
 
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -509,6 +681,8 @@ pub async fn attach(url: &str) -> i32 {
     let _ = tokio::time::timeout(Duration::from_millis(500), &mut writer_handle).await;
     writer_handle.abort();
     reader_handle.abort();
+    render_stop.store(true, Ordering::Relaxed);
+    let _ = renderer.join();
     drop(guard);
     0
 }

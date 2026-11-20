@@ -175,6 +175,12 @@ If the client attaches after the agent, the server replays the buffered output
 - **Input:** client text becomes `computer.pushSignal("key_down", keyboard,
   char, code)` inside a wrapper around `computer.pullSignal`. The keyboard
   address matters: OpenOS filters key events by `tty.keyboard()`.
+- **Client rendering:** the CLI keeps a local 80x25 VT100 screen (`vt100`
+  crate), feeds it the agent's output, and renders that screen into your
+  terminal with explicit row positioning. A 120-column local terminal
+  therefore does not change the OC line breaks. The agent also resizes the
+  OpenComputers GPU to 80x25 (clamped to its maximum) on startup and when the
+  client sends `S 80 25`.
 - **Cooperative:** OpenComputers cannot preempt Lua. Input and output are
   serviced when the shell waits on an event (which it normally does). A
   program that never yields will not stream and cannot be interrupted.
@@ -183,6 +189,9 @@ If the client attaches after the agent, the server replays the buffered output
 
 ## Limits
 
+- **Terminal size:** the client needs at least an 80x25 terminal. It renders a
+  fixed 80x25 screen; extra columns/rows are unused. The in-game GPU is resized
+  to 80x25 if its maximum allows.
 - **Raw terminal stream, not a GPU mirror.** Programs that draw directly with
   `gpu.set` instead of using `term`/`tty` will not render through OCShell.
   Normal shell commands, `lua`, and most `term`-based programs work.

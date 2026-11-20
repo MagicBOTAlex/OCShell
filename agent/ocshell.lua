@@ -279,6 +279,23 @@ local function queue_term(value)
   end
 end
 
+local function resize_screen(cols, rows)
+  if not (component.isAvailable and component.isAvailable("gpu")) then
+    return
+  end
+  local gpu = component.gpu
+  local ok, max_width, max_height = pcall(gpu.maxResolution)
+  if not ok or type(max_width) ~= "number" or type(max_height) ~= "number" then
+    return
+  end
+  local width = math.max(1, math.min(tonumber(cols) or 80, max_width))
+  local height = math.max(1, math.min(tonumber(rows) or 25, max_height))
+  local resized, changed = pcall(gpu.setResolution, width, height)
+  if resized and changed then
+    queue_term("\27[2J\27[H")
+  end
+end
+
 local function process_input(text)
   for line in text:gmatch("[^\r\n]+") do
     local command, rest = line:match("^(%S+)%s*(.*)$")
@@ -301,7 +318,10 @@ local function process_input(text)
     elseif command == "X" then
       computer.pushSignal("interrupted")
     elseif command == "S" then
-      -- Client-side terminal size; the OC screen is fixed by the GPU.
+      local cols, rows = rest:match("^(%d+)%s+(%d+)$")
+      if cols then
+        resize_screen(tonumber(cols), tonumber(rows))
+      end
     end
   end
 end
@@ -509,6 +529,7 @@ local function wrapped_pull(timeout)
 end
 
 computer.pullSignal = wrapped_pull
+resize_screen(80, 25)
 queue_term("\27[2J\27[H")
 if http_mode then
   http_tick("starting")
